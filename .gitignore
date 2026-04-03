@@ -1,0 +1,18 @@
+# Credentials & secrets
+.env
+
+# Historique des annonces (données locales)
+annonces_vues.json
+
+# Logs
+veille.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+venv/

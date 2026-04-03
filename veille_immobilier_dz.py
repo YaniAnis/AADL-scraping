@@ -5,7 +5,7 @@
 ╚══════════════════════════════════════════════════════════════╝
  
 INSTALLATION :
-    pip install selenium beautifulsoup4 lxml webdriver-manager requests
+    pip install selenium beautifulsoup4 lxml webdriver-manager requests python-dotenv
  
     Selenium simule un vrai navigateur Chrome pour contourner
     le blocage anti-scraping de AADL (erreur 403).
@@ -16,7 +16,7 @@ PRÉREQUIS :
     - Le script télécharge ChromeDriver automatiquement
  
 CONFIGURATION :
-    1. Remplissez EMAIL_CONFIG avec vos identifiants Gmail
+    1. Copiez .env.example en .env et remplissez vos identifiants
     2. Pour Gmail : Mon compte Google > Sécurité >
        Authentification 2 facteurs > Mots de passe d'application
     3. Lancez : python veille_immobilier_dz.py
@@ -32,15 +32,24 @@ import smtplib
 import json
 import hashlib
 import os
+import sys
 import logging
 import time
 import requests
 import urllib3
-from datetime import datetime
+from datetime import datetime, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from urllib.parse import urljoin
 from bs4 import BeautifulSoup
  
+# python-dotenv — charge les variables d'environnement depuis .env
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # Si python-dotenv n'est pas installé, on utilise les variables système
+
 # Selenium — navigateur Chrome headless
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
@@ -59,19 +68,41 @@ except ImportError:
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
  
 # ─────────────────────────────────────────────
-#  ⚙️  CONFIGURATION — À MODIFIER
+#  ⚙️  CONFIGURATION — Chargée depuis .env
 # ─────────────────────────────────────────────
- 
-EMAIL_CONFIG = {
-    "expediteur":   "yanilikou02@gmail.com",      # Votre adresse Gmail
-    "mot_de_passe": "gpto ywjs xsbq izca",         # Mot de passe d'application Gmail (16 caractères)
-    "destinataire": "yanilikou02@gmail.com",        # Email où recevoir les alertes (peut être le même)
-    "smtp_server":  "smtp.gmail.com",
-    "smtp_port":    587,
-}
+
+def _charger_config_email():
+    """Charge la configuration email depuis les variables d'environnement (.env)."""
+    config = {
+        "expediteur":   os.getenv("EMAIL_EXPEDITEUR", ""),
+        "mot_de_passe": os.getenv("EMAIL_MOT_DE_PASSE", ""),
+        "destinataire": os.getenv("EMAIL_DESTINATAIRE", ""),
+        "smtp_server":  os.getenv("SMTP_SERVER", "smtp.gmail.com"),
+        "smtp_port":    int(os.getenv("SMTP_PORT", "587")),
+    }
+    # Validation au démarrage
+    champs_requis = ["expediteur", "mot_de_passe", "destinataire"]
+    manquants = [c for c in champs_requis if not config[c]]
+    if manquants:
+        print("=" * 60)
+        print("❌ ERREUR DE CONFIGURATION")
+        print("=" * 60)
+        print(f"   Variable(s) manquante(s) dans .env : {', '.join(manquants)}")
+        print()
+        print("   → Copiez .env.example en .env et remplissez vos identifiants :")
+        print("     cp .env.example .env")
+        print("=" * 60)
+        sys.exit(1)
+    return config
+
+
+EMAIL_CONFIG = _charger_config_email()
  
 # Fichier mémoire des annonces déjà vues
 FICHIER_HISTORIQUE = "annonces_vues.json"
+
+# Durée de rétention des entrées dans l'historique (en jours)
+RETENTION_HISTORIQUE_JOURS = 90
  
 # ─────────────────────────────────────────────
 #  🌐  SITES SURVEILLÉS
@@ -132,19 +163,58 @@ HEADERS_REQUESTS = {
  
  
 def charger_historique():
+    """Charge l'historique depuis le fichier JSON, avec pruning automatique."""
     if os.path.exists(FICHIER_HISTORIQUE):
-        with open(FICHIER_HISTORIQUE, "r", encoding="utf-8") as f:
-            return json.load(f)
+        try:
+            with open(FICHIER_HISTORIQUE, "r", encoding="utf-8") as f:
+                historique = json.load(f)
+        except (json.JSONDecodeError, IOError) as e:
+            log.warning(f"⚠️  Historique corrompu, remise à zéro : {e}")
+            return {}
+
+        # Pruning : supprimer les entrées plus vieilles que RETENTION_HISTORIQUE_JOURS
+        seuil = datetime.now() - timedelta(days=RETENTION_HISTORIQUE_JOURS)
+        avant = len(historique)
+        historique_filtre = {}
+        for cle, val in historique.items():
+            date_str = val.get("date", "")
+            try:
+                date_entry = datetime.strptime(date_str, "%d/%m/%Y %H:%M")
+                if date_entry >= seuil:
+                    historique_filtre[cle] = val
+            except (ValueError, TypeError):
+                # Garder les entrées sans date valide (rétrocompatibilité)
+                historique_filtre[cle] = val
+
+        supprimees = avant - len(historique_filtre)
+        if supprimees > 0:
+            log.info(f"🧹 Historique purgé : {supprimees} entrée(s) de plus de {RETENTION_HISTORIQUE_JOURS} jours supprimée(s)")
+
+        return historique_filtre
     return {}
  
  
 def sauvegarder_historique(historique):
-    with open(FICHIER_HISTORIQUE, "w", encoding="utf-8") as f:
-        json.dump(historique, f, ensure_ascii=False, indent=2)
+    """Sauvegarde l'historique dans le fichier JSON de manière atomique."""
+    fichier_tmp = FICHIER_HISTORIQUE + ".tmp"
+    try:
+        with open(fichier_tmp, "w", encoding="utf-8") as f:
+            json.dump(historique, f, ensure_ascii=False, indent=2)
+        # Remplacement atomique (évite la corruption si le script est interrompu)
+        if os.path.exists(FICHIER_HISTORIQUE):
+            os.replace(fichier_tmp, FICHIER_HISTORIQUE)
+        else:
+            os.rename(fichier_tmp, FICHIER_HISTORIQUE)
+    except IOError as e:
+        log.error(f"❌ Erreur sauvegarde historique : {e}")
+        # Nettoyer le fichier temporaire en cas d'erreur
+        if os.path.exists(fichier_tmp):
+            os.remove(fichier_tmp)
  
  
 def generer_id(texte):
-    return hashlib.md5(texte.encode("utf-8")).hexdigest()
+    """Génère un identifiant unique pour une annonce (SHA-256)."""
+    return hashlib.sha256(texte.encode("utf-8")).hexdigest()
  
  
 def creer_driver_chrome():
@@ -169,13 +239,23 @@ def creer_driver_chrome():
         service = Service()
     driver = webdriver.Chrome(service=service, options=options)
  
-    # Masquer la signature Selenium dans le JS
-    driver.execute_script(
-        "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+    # Masquer la signature Selenium via CDP (avant tout chargement de page)
+    driver.execute_cdp_cmd(
+        "Page.addScriptToEvaluateOnNewDocument",
+        {"source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"},
     )
     return driver
  
  
+def construire_lien(href, url_base):
+    """Construit une URL absolue à partir d'un href et d'une URL de base."""
+    if not href:
+        return ""
+    if href.startswith("http"):
+        return href
+    return urljoin(url_base + "/", href)
+
+
 def parser_tableau(html, url_base, nom_site):
     """
     Parse le HTML et extrait les lignes de tableaux.
@@ -196,8 +276,7 @@ def parser_tableau(html, url_base, nom_site):
                 lien_el = el.find("a")
                 lien = ""
                 if lien_el and lien_el.get("href"):
-                    href = lien_el["href"]
-                    lien = href if href.startswith("http") else url_base + href
+                    lien = construire_lien(lien_el["href"], url_base)
                 annonces.append({
                     "titre": texte[:300],
                     "lien": lien,
@@ -236,8 +315,7 @@ def parser_tableau(html, url_base, nom_site):
             lien_el = row.find("a")
             lien = ""
             if lien_el and lien_el.get("href"):
-                href = lien_el["href"]
-                lien = href if href.startswith("http") else url_base + href
+                lien = construire_lien(lien_el["href"], url_base)
  
             annonces.append({
                 "titre": titre[:400],
@@ -403,7 +481,8 @@ def construire_email_html(nouvelles_annonces):
     </body></html>"""
  
  
-def envoyer_email(nouvelles_annonces):
+def envoyer_email(nouvelles_annonces, max_tentatives=3):
+    """Envoie l'email d'alerte avec retry automatique en cas d'erreur transitoire."""
     if not nouvelles_annonces:
         return
  
@@ -419,16 +498,25 @@ def envoyer_email(nouvelles_annonces):
     msg.attach(MIMEText(texte, "plain", "utf-8"))
     msg.attach(MIMEText(construire_email_html(nouvelles_annonces), "html", "utf-8"))
  
-    try:
-        with smtplib.SMTP(EMAIL_CONFIG["smtp_server"], EMAIL_CONFIG["smtp_port"]) as srv:
-            srv.starttls()
-            srv.login(EMAIL_CONFIG["expediteur"], EMAIL_CONFIG["mot_de_passe"])
-            srv.sendmail(EMAIL_CONFIG["expediteur"], EMAIL_CONFIG["destinataire"], msg.as_string())
-        log.info(f"📧 Email envoyé avec {len(nouvelles_annonces)} nouvelle(s) entrée(s) !")
-    except smtplib.SMTPAuthenticationError:
-        log.error("❌ Erreur Gmail : vérifiez votre mot de passe d'application (16 caractères).")
-    except Exception as e:
-        log.error(f"❌ Erreur envoi email : {e}")
+    for tentative in range(1, max_tentatives + 1):
+        try:
+            with smtplib.SMTP(EMAIL_CONFIG["smtp_server"], EMAIL_CONFIG["smtp_port"]) as srv:
+                srv.starttls()
+                srv.login(EMAIL_CONFIG["expediteur"], EMAIL_CONFIG["mot_de_passe"])
+                srv.sendmail(EMAIL_CONFIG["expediteur"], EMAIL_CONFIG["destinataire"], msg.as_string())
+            log.info(f"📧 Email envoyé avec {len(nouvelles_annonces)} nouvelle(s) entrée(s) !")
+            return  # Succès, on sort
+        except smtplib.SMTPAuthenticationError:
+            log.error("❌ Erreur Gmail : vérifiez votre mot de passe d'application (16 caractères).")
+            return  # Pas de retry pour les erreurs d'authentification
+        except Exception as e:
+            log.warning(f"   ⚠️  Tentative {tentative}/{max_tentatives} échouée : {e}")
+            if tentative < max_tentatives:
+                delai = tentative * 5  # Backoff : 5s, 10s, 15s
+                log.info(f"   ⏳ Nouvelle tentative dans {delai}s...")
+                time.sleep(delai)
+            else:
+                log.error(f"❌ Échec définitif de l'envoi email après {max_tentatives} tentatives.")
  
  
 # ─────────────────────────────────────────────
