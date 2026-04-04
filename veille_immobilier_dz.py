@@ -5,7 +5,7 @@
 ╚══════════════════════════════════════════════════════════════╝
  
 INSTALLATION :
-    pip install selenium beautifulsoup4 lxml webdriver-manager requests python-dotenv
+    pip install selenium beautifulsoup4 lxml requests python-dotenv
  
     Selenium simule un vrai navigateur Chrome pour contourner
     le blocage anti-scraping de AADL (erreur 403).
@@ -53,17 +53,12 @@ except ImportError:
 # Selenium — navigateur Chrome headless
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
  
-# Téléchargement automatique du ChromeDriver
-try:
-    from webdriver_manager.chrome import ChromeDriverManager
-    WEBDRIVER_MANAGER = True
-except ImportError:
-    WEBDRIVER_MANAGER = False
+# Selenium 4.6+ inclut Selenium Manager qui télécharge ChromeDriver automatiquement
+# Pas besoin de webdriver-manager
  
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
  
@@ -233,11 +228,8 @@ def creer_driver_chrome():
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
     )
  
-    if WEBDRIVER_MANAGER:
-        service = Service(ChromeDriverManager().install())
-    else:
-        service = Service()
-    driver = webdriver.Chrome(service=service, options=options)
+    # Selenium Manager (intégré à Selenium 4.6+) gère ChromeDriver automatiquement
+    driver = webdriver.Chrome(options=options)
  
     # Masquer la signature Selenium via CDP (avant tout chargement de page)
     driver.execute_cdp_cmd(
